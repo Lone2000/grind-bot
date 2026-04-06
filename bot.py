@@ -291,6 +291,16 @@ REDDIT_USER_AGENT = os.getenv(
     "discord-karma-verifier/1.0 (contact: admin@example.com)"
 ).strip()
 
+# Reddit proxy settings (optional)
+REDDIT_PROXY_URL = os.getenv("REDDIT_PROXY_URL", "").strip()
+REDDIT_PROXY_USERNAME = os.getenv("REDDIT_PROXY_USERNAME", "").strip()
+REDDIT_PROXY_PASSWORD = os.getenv("REDDIT_PROXY_PASSWORD", "").strip()
+
+# Build proxy URL with embedded auth if configured
+_REDDIT_PROXY = None
+if REDDIT_PROXY_URL and REDDIT_PROXY_USERNAME and REDDIT_PROXY_PASSWORD:
+    _REDDIT_PROXY = REDDIT_PROXY_URL.replace("http://", f"http://{REDDIT_PROXY_USERNAME}:{REDDIT_PROXY_PASSWORD}@")
+
 # simple in-memory cache to reduce reddit hits
 _REDDIT_CACHE: Dict[str, Tuple[int, int, int, int]] = {}  # username -> (post, comment, total, expiry_ts)
 _REDDIT_CACHE_TTL = 300  # 5 min
@@ -319,7 +329,7 @@ async def fetch_reddit_karma(username: str) -> tuple[int, int, int]:
     async def _try_about_json(url: str) -> Optional[tuple[int, int, int]]:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, proxy=_REDDIT_PROXY) as resp:
                 if resp.status == 404:
                     raise ValueError("reddit user not found")
                 if resp.status == 429:
@@ -359,7 +369,7 @@ async def fetch_reddit_karma(username: str) -> tuple[int, int, int]:
     html_url = f"https://old.reddit.com/user/{u}/"
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(html_url, headers=headers) as resp:
+        async with session.get(html_url, headers=headers, proxy=_REDDIT_PROXY) as resp:
             if resp.status == 404:
                 raise ValueError("reddit user not found")
             if resp.status == 429:
