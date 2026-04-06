@@ -296,10 +296,14 @@ REDDIT_PROXY_URL = os.getenv("REDDIT_PROXY_URL", "").strip()
 REDDIT_PROXY_USERNAME = os.getenv("REDDIT_PROXY_USERNAME", "").strip()
 REDDIT_PROXY_PASSWORD = os.getenv("REDDIT_PROXY_PASSWORD", "").strip()
 
-# Build proxy URL with embedded auth if configured
+# Build proxy URL with embedded auth if configured (URL-encode for special chars like commas)
 _REDDIT_PROXY = None
 if REDDIT_PROXY_URL and REDDIT_PROXY_USERNAME and REDDIT_PROXY_PASSWORD:
-    _REDDIT_PROXY = REDDIT_PROXY_URL.replace("http://", f"http://{REDDIT_PROXY_USERNAME}:{REDDIT_PROXY_PASSWORD}@")
+    from urllib.parse import quote
+    # URL-encode username and password to handle special characters (commas, colons, etc)
+    encoded_user = quote(REDDIT_PROXY_USERNAME, safe="")
+    encoded_pass = quote(REDDIT_PROXY_PASSWORD, safe="")
+    _REDDIT_PROXY = REDDIT_PROXY_URL.replace("http://", f"http://{encoded_user}:{encoded_pass}@")
 
 # simple in-memory cache to reduce reddit hits
 _REDDIT_CACHE: Dict[str, Tuple[int, int, int, int]] = {}  # username -> (post, comment, total, expiry_ts)
