@@ -765,15 +765,6 @@ async def run_multi_assign_window(
         except Exception:
             dm_ok = False
 
-        # in-channel reply
-        try:
-            await announce_ch.send(
-                f"{member.mention} claimed **task #{task_no}**.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except Exception:
-            pass
-
         await send_logs(
             guild,
             "✅ **task assigned**\n"
