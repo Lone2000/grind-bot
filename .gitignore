@@ -1,0 +1,53 @@
+# Environment & credentials (NEVER commit these)
+.env
+.env.local
+.env.*.local
+service_account.json
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific (large files, local testing)
+data/
+*.zip
+Grind Bot.zip
+Grind-bot-share/
+Nexus - bot Files/
+Nexus - bot Files (2).zip
+Nexus - VPS Deployment - Claude Code/
+Restart Bot or Update code commands.txt
+Launch Bot.txt
+ssh/
