@@ -843,11 +843,12 @@ async def run_task_batch(guild: discord.Guild, number_of_tasks: int, run_event: 
         else:
             cooldown_str = f"{cooldown_seconds} second{'s' if cooldown_seconds != 1 else ''}"
 
+        minutes_remaining = reaction_time_sec // 60
         text = (
             f"{ping_txt}\n"
             f"**React to claim a task** {CLAIM_EMOJI}\n\n"
             f"📋 **{count} task{'s' if count != 1 else ''} available**\n"
-            f"⏱️ **Next Task Ping in:** {reaction_time_sec} seconds\n"
+            f"⏱️ **Next Task Ping in:** {minutes_remaining} minute{'s' if minutes_remaining != 1 else ''}\n"
             f"⏸️ **Cooldown after claim:** {cooldown_str}\n\n"
             f"Tasks are first come, first serve. After reacting, you'll get a DM with the sheet link and your assigned task number. Look for your Discord username in column E.\n\n"
             f"**EVERYONE SHOULD REACT here to claim a task.**"
@@ -979,19 +980,19 @@ async def reddit_verify_yourself(interaction: discord.Interaction, username: str
 @app_commands.describe(
     announce_channel="Channel where task posts go",
     logs_channel="Channel where logs go",
-    reaction_time_sec="Seconds users have to react (claim window)",
+    reaction_time_min="Minutes users have to react per ping (1-60)",
     ping_role="Role to ping for each task post (optional)",
     cooldown_role="Role/tag given to winners, removed after cooldown duration",
-    cooldown_duration="Cooldown duration like 2h, 120m, 7200s (plain number = minutes)",
+    cooldown_hours="Cooldown duration in hours (e.g. 2 = 2 hours)",
     google_sheet_url="Google Sheet URL (or local xlsx path for testing). If omitted, keeps previous.",
 )
 async def config_settings(
     interaction: discord.Interaction,
     announce_channel: discord.TextChannel,
     logs_channel: discord.TextChannel,
-    reaction_time_sec: app_commands.Range[int, 5, 3600],
+    reaction_time_min: app_commands.Range[int, 1, 60],
     cooldown_role: discord.Role,
-    cooldown_duration: str,
+    cooldown_hours: app_commands.Range[int, 1, 168],
     ping_role: Optional[discord.Role] = None,
     google_sheet_url: Optional[str] = None,
 ) -> None:
@@ -1008,11 +1009,11 @@ async def config_settings(
 
     cfg["announce_channel_id"] = announce_channel.id
     cfg["logs_channel_id"] = logs_channel.id
-    cfg["reaction_time_sec"] = int(reaction_time_sec)
+    cfg["reaction_time_sec"] = int(reaction_time_min) * 60  # convert minutes to seconds
     cfg["ping_role_id"] = ping_role.id if ping_role else None
 
     cfg["cooldown_role_id"] = cooldown_role.id
-    cfg["cooldown_seconds"] = int(parse_duration_to_seconds(cooldown_duration))
+    cfg["cooldown_seconds"] = int(cooldown_hours) * 3600  # convert hours to seconds
 
     save_config(interaction.guild.id, cfg)
 
@@ -1020,10 +1021,10 @@ async def config_settings(
         "✅ config saved.\n"
         f"- announce: {announce_channel.mention}\n"
         f"- logs: {logs_channel.mention}\n"
-        f"- reaction time: {reaction_time_sec}s\n"
+        f"- reaction time: {reaction_time_min} min\n"
         f"- ping role: {ping_role.name if ping_role else '(none)'}\n"
         f"- cooldown tag: {cooldown_role.name}\n"
-        f"- cooldown: {cfg['cooldown_seconds']}s\n"
+        f"- cooldown: {cooldown_hours}h\n"
         f"- sheet: {cfg.get('sheet_url') or '(not set)'}",
         ephemeral=True,
     )
@@ -1183,10 +1184,10 @@ async def show_config(interaction: discord.Interaction) -> None:
         "current config:\n"
         f"- announce: {announce.mention if announce else '(not set)'}\n"
         f"- logs: {logs.mention if logs else '(not set)'}\n"
-        f"- reaction_time_sec: {cfg.get('reaction_time_sec')}\n"
+        f"- reaction time: {cfg.get('reaction_time_sec', 0) // 60} min\n"
         f"- ping_role: {ping_role.name if ping_role else '(none)'}\n"
         f"- cooldown_role: {cooldown_role.name if cooldown_role else '(not set)'}\n"
-        f"- cooldown_seconds: {cfg.get('cooldown_seconds')}\n"
+        f"- cooldown: {cfg.get('cooldown_seconds', 0) // 3600} hours\n"
         f"- sheet_url: {cfg.get('sheet_url') or '(not set)'}",
         ephemeral=True,
     )
