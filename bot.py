@@ -807,19 +807,21 @@ async def run_task_batch(guild: discord.Guild, number_of_tasks: int, run_event: 
     cooldown_role = get_role_by_id(guild, cfg.get("cooldown_role_id"))
     cooldown_seconds = int(cfg.get("cooldown_seconds", 7200))
 
-    # load all requested tasks upfront
-    try:
-        task_pool = await get_tasks_batch(sheet_src, number_of_tasks)
-    except Exception as e:
-        await send_logs(guild, f"⚠️ sheet read failed: {e}")
-        return
+    # ping-window loop: re-read sheet before each ping (allows reshuffle)
+    assigned_count = 0
+    while assigned_count < number_of_tasks:
+        # Fetch fresh tasks from sheet (picks up manually cleared rows)
+        remaining = number_of_tasks - assigned_count
+        try:
+            task_pool = await get_tasks_batch(sheet_src, remaining)
+        except Exception as e:
+            await send_logs(guild, f"⚠️ sheet read failed: {e}")
+            break
 
-    if not task_pool:
-        await send_logs(guild, "🛑 no unassigned tasks found in sheet.")
-        return
+        if not task_pool:
+            await send_logs(guild, "🛑 no more unassigned tasks found in sheet.")
+            break
 
-    # ping-window loop: keep posting pings until pool is empty
-    while task_pool:
         while not run_event.is_set():
             await asyncio.sleep(0.5)
 
@@ -853,11 +855,12 @@ async def run_task_batch(guild: discord.Guild, number_of_tasks: int, run_event: 
             await asyncio.sleep(2)
             continue
 
-        await run_multi_assign_window(
+        newly_assigned = await run_multi_assign_window(
             guild, msg, task_pool, sheet_src,
             reaction_time_sec, cooldown_role, cooldown_seconds,
             run_event, announce_ch,
         )
+        assigned_count += newly_assigned
 
         # clean up the ping message after window closes
         try:
@@ -865,8 +868,8 @@ async def run_task_batch(guild: discord.Guild, number_of_tasks: int, run_event: 
         except Exception:
             pass
 
-        if task_pool:
-            await send_logs(guild, f"🔄 {len(task_pool)} task(s) remaining — opening new ping window.")
+        if assigned_count < number_of_tasks:
+            await send_logs(guild, f"🔄 {number_of_tasks - assigned_count} task(s) remaining — opening new ping window.")
 
     await send_logs(guild, "✅ all tasks assigned.")
 
@@ -974,7 +977,7 @@ async def reddit_verify_yourself(interaction: discord.Interaction, username: str
     reaction_time_min="Minutes users have to react per ping (1-60)",
     ping_role="Role to ping for each task post (optional)",
     cooldown_role="Role/tag given to winners, removed after cooldown duration",
-    cooldown_hours="Cooldown duration in hours (e.g. 2 = 2 hours)",
+    cooldown_hours="Cooldown duration in hours (e.g. 1.5, 2, 2.5)",
     google_sheet_url="Google Sheet URL (or local xlsx path for testing). If omitted, keeps previous.",
 )
 async def config_settings(
@@ -983,7 +986,7 @@ async def config_settings(
     logs_channel: discord.TextChannel,
     reaction_time_min: app_commands.Range[int, 1, 60],
     cooldown_role: discord.Role,
-    cooldown_hours: app_commands.Range[int, 1, 168],
+    cooldown_hours: app_commands.Range[float, 0.5, 168.0],
     ping_role: Optional[discord.Role] = None,
     google_sheet_url: Optional[str] = None,
 ) -> None:
@@ -1004,7 +1007,7 @@ async def config_settings(
     cfg["ping_role_id"] = ping_role.id if ping_role else None
 
     cfg["cooldown_role_id"] = cooldown_role.id
-    cfg["cooldown_seconds"] = int(cooldown_hours) * 3600  # convert hours to seconds
+    cfg["cooldown_seconds"] = int(cooldown_hours * 3600)  # convert hours to seconds
 
     save_config(interaction.guild.id, cfg)
 
@@ -1171,6 +1174,9 @@ async def show_config(interaction: discord.Interaction) -> None:
     ping_role = get_role_by_id(interaction.guild, cfg.get("ping_role_id"))
     cooldown_role = get_role_by_id(interaction.guild, cfg.get("cooldown_role_id"))
 
+    cooldown_h = cfg.get('cooldown_seconds', 0) / 3600
+    cooldown_display = int(cooldown_h) if cooldown_h == int(cooldown_h) else cooldown_h
+
     await interaction.response.send_message(
         "current config:\n"
         f"- announce: {announce.mention if announce else '(not set)'}\n"
@@ -1178,7 +1184,7 @@ async def show_config(interaction: discord.Interaction) -> None:
         f"- reaction time: {cfg.get('reaction_time_sec', 0) // 60} min\n"
         f"- ping_role: {ping_role.name if ping_role else '(none)'}\n"
         f"- cooldown_role: {cooldown_role.name if cooldown_role else '(not set)'}\n"
-        f"- cooldown: {cfg.get('cooldown_seconds', 0) // 3600} hours\n"
+        f"- cooldown: {cooldown_display} hours\n"
         f"- sheet_url: {cfg.get('sheet_url') or '(not set)'}",
         ephemeral=True,
     )
