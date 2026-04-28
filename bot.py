@@ -106,6 +106,7 @@ def save_state(guild_id: int, state: Dict[str, Any]) -> None:
 # =========================
 CLAIM_EMOJI = "✅"
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
+POOL_REFRESH_INTERVAL_SEC = 15  # how often run_multi_assign_window re-reads sheet for cleared rows
 
 # create_task run control
 RUN_LOCKS: Dict[int, asyncio.Lock] = {}
@@ -739,6 +740,7 @@ async def run_multi_assign_window(
     pool_lock = asyncio.Lock()
     pending: list[asyncio.Task] = []
     assigned_count = 0
+    last_refresh_time = time.monotonic()
 
     def check(reaction: discord.Reaction, user: discord.User) -> bool:
         if user.bot:
@@ -752,6 +754,28 @@ async def run_multi_assign_window(
             await reaction.remove(user)
         except Exception:
             pass
+
+    async def refresh_pool_from_sheet() -> int:
+        """Re-read sheet and merge any newly-unassigned rows into task_pool.
+        Lets users manually clear Col E mid-window and have the row claimable
+        in the same ping window. Returns count of rows added."""
+        nonlocal last_refresh_time
+        try:
+            fresh = await get_tasks_batch(sheet_src, 1000)
+        except Exception:
+            last_refresh_time = time.monotonic()
+            return 0
+        added = 0
+        async with pool_lock:
+            existing_rows = {ri for ri, _ in task_pool}
+            for ri, tno in fresh:
+                if ri not in existing_rows:
+                    task_pool.append((ri, tno))
+                    added += 1
+        last_refresh_time = time.monotonic()
+        if added > 0:
+            await send_logs(guild, f"🔄 mid-window refresh: +{added} task(s) picked up from sheet")
+        return added
 
     async def process_one(reaction, user):
         nonlocal assigned_count
@@ -827,9 +851,20 @@ async def run_multi_assign_window(
 
     remaining = float(reaction_time_sec)
     while remaining > 0:
+        # periodic refresh — every ~POOL_REFRESH_INTERVAL_SEC, pull in any rows
+        # the user manually cleared in Col E since the last refresh
+        if time.monotonic() - last_refresh_time >= POOL_REFRESH_INTERVAL_SEC:
+            await refresh_pool_from_sheet()
+
         async with pool_lock:
-            if not task_pool:
-                break
+            pool_empty = not task_pool
+
+        if pool_empty:
+            # one immediate refresh; if still empty, end the window early
+            await refresh_pool_from_sheet()
+            async with pool_lock:
+                if not task_pool:
+                    break
 
         if not run_event.is_set():
             await asyncio.sleep(0.5)
