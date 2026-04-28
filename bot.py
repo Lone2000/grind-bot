@@ -504,6 +504,40 @@ async def assign_task(sheet_url_or_path: str, row_index: int, discord_username: 
     await asyncio.to_thread(_excel_assign, src, row_index, discord_username)
 
 
+def _google_find_task_row(sheet_url: str, task_no: str) -> Optional[int]:
+    gc = _google_client()
+    sh = gc.open_by_url(sheet_url)
+    ws = sh.get_worksheet(0)
+    values = ws.get_all_values()
+    target = str(task_no).strip()
+    for idx, row in enumerate(values[1:], start=2):
+        if (row[0] if len(row) > 0 else "").strip() == target:
+            return idx
+    return None
+
+
+def _excel_find_task_row(xlsx_path: str, task_no: str) -> Optional[int]:
+    wb = openpyxl.load_workbook(xlsx_path)
+    ws = wb.active
+    target = str(task_no).strip()
+    for r in range(2, ws.max_row + 1):
+        cell_val = ws.cell(r, 1).value
+        if cell_val is None:
+            continue
+        if str(cell_val).strip() == target:
+            return r
+    return None
+
+
+async def find_task_row(sheet_url_or_path: str, task_no: str) -> Optional[int]:
+    src = (sheet_url_or_path or "").strip()
+    if not src:
+        return None
+    if is_google_sheet_url(src):
+        return await asyncio.to_thread(_google_find_task_row, src, task_no)
+    return await asyncio.to_thread(_excel_find_task_row, src, task_no)
+
+
 # =========================
 # BATCH TASK FETCHING (for multi-claim feature)
 # =========================
@@ -681,11 +715,13 @@ async def run_multi_assign_window(
 ) -> int:
     """
     Listen for reactions on a ping message for reaction_time_sec.
-    Assign one random task per valid reactor immediately (no waiting).
-    Removes assigned tasks from task_pool (mutates in place).
+    Each valid reaction is processed concurrently (background task) so users 2-N
+    don't wait while user 1's network calls (sheet write, DM, role, log) complete.
+    Tasks are claimed top-down (lowest row first) under a lock to avoid double-claims.
     Returns count of tasks assigned.
     """
-    remaining = float(reaction_time_sec)
+    pool_lock = asyncio.Lock()
+    pending: list[asyncio.Task] = []
     assigned_count = 0
 
     def check(reaction: discord.Reaction, user: discord.User) -> bool:
@@ -701,39 +737,22 @@ async def run_multi_assign_window(
         except Exception:
             pass
 
-    while remaining > 0 and task_pool:
-        # pause handling
-        if not run_event.is_set():
-            await asyncio.sleep(0.5)
-            continue
-
-        tick = min(1.0, remaining)
-        start = time.monotonic()
-
-        try:
-            reaction, user = await bot.wait_for("reaction_add", timeout=tick, check=check)
-        except asyncio.TimeoutError:
-            remaining -= (time.monotonic() - start)
-            continue
-
-        remaining -= (time.monotonic() - start)
-
-        # fetch member (ALWAYS fetch fresh to get updated role state)
+    async def process_one(reaction, user):
+        nonlocal assigned_count
         try:
             member = await guild.fetch_member(user.id)
         except Exception:
-            continue
+            return
 
-        # reject: on cooldown (PRIMARY control)
         if await is_member_on_cooldown(guild, member):
             await try_remove_reaction(reaction, user)
-            continue
+            return
 
-        # pick a random task from pool
-        if not task_pool:
-            break
-        chosen = random.choice(task_pool)
-        task_pool.remove(chosen)
+        # claim a task atomically (sequential top-down)
+        async with pool_lock:
+            if not task_pool:
+                return
+            chosen = task_pool.pop(0)
         row_index, task_no = chosen
 
         # write to sheet
@@ -741,8 +760,9 @@ async def run_multi_assign_window(
             await assign_task(sheet_src, row_index, member.name)
         except Exception as e:
             await send_logs(guild, f"⚠️ sheet write failed for task #{task_no}: {e}")
-            task_pool.append(chosen)  # put it back on failure
-            continue
+            async with pool_lock:
+                task_pool.append(chosen)  # put it back on failure
+            return
 
         # apply cooldown
         expiry = now_ts() + cooldown_seconds
@@ -776,7 +796,36 @@ async def run_multi_assign_window(
             f"- cooldown: {cooldown_seconds}s"
         )
 
-        assigned_count += 1
+        async with pool_lock:
+            assigned_count += 1
+
+    remaining = float(reaction_time_sec)
+    while remaining > 0:
+        async with pool_lock:
+            if not task_pool:
+                break
+
+        if not run_event.is_set():
+            await asyncio.sleep(0.5)
+            continue
+
+        tick = min(1.0, remaining)
+        start = time.monotonic()
+
+        try:
+            reaction, user = await bot.wait_for("reaction_add", timeout=tick, check=check)
+        except asyncio.TimeoutError:
+            remaining -= (time.monotonic() - start)
+            continue
+
+        remaining -= (time.monotonic() - start)
+
+        # spawn — DON'T await; loop returns to wait_for immediately
+        pending.append(asyncio.create_task(process_one(reaction, user)))
+
+    # let in-flight reactions finish before the window closes
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
     return assigned_count
 
@@ -1055,6 +1104,64 @@ async def create_task(interaction: discord.Interaction, number_of_tasks: app_com
             await run_task_batch(guild, int(number_of_tasks), run_event)
 
     RUNNING_JOBS[guild.id] = asyncio.create_task(runner())
+
+
+# =========================
+# COMMAND: reshuffle (unassign a task)
+# =========================
+@bot.tree.command(
+    name="reshuffle",
+    description="Unassign a task (clears Col E) so it can be reclaimed.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(task_number="Task number from Col A (e.g. 7)")
+async def reshuffle(interaction: discord.Interaction, task_number: str) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("run this in a server.", ephemeral=True)
+        return
+
+    cfg = load_config(interaction.guild.id)
+    sheet_src = str(cfg.get("sheet_url") or "").strip()
+    if not sheet_src:
+        await interaction.response.send_message("⚠️ sheet not configured.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        row_idx = await find_task_row(sheet_src, task_number)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ sheet read failed: {e}", ephemeral=True)
+        return
+
+    if not row_idx:
+        await interaction.followup.send(f"❌ task #{task_number} not found in sheet.", ephemeral=True)
+        return
+
+    try:
+        await assign_task(sheet_src, row_idx, "")  # clear Col E
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ failed to clear Col E: {e}", ephemeral=True)
+        return
+
+    job = RUNNING_JOBS.get(interaction.guild.id)
+    batch_running = bool(job and not job.done())
+
+    await send_logs(
+        interaction.guild,
+        f"🔄 **task #{task_number} reshuffled** by {interaction.user.mention} (row {row_idx})"
+    )
+
+    if batch_running:
+        await interaction.followup.send(
+            f"✅ task #{task_number} unassigned. It'll be picked up in the next ping window.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"✅ task #{task_number} unassigned. Run `/create_task 1` to ping for it.",
+            ephemeral=True,
+        )
 
 
 # =========================
