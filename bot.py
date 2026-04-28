@@ -456,10 +456,21 @@ def _google_get_next_task(sheet_url: str) -> Optional[SheetTask]:
     return None
 
 
+class RowAlreadyAssignedError(Exception):
+    """Raised when trying to assign a task to a row whose Col E is already filled."""
+    pass
+
+
 def _google_assign(sheet_url: str, row_index: int, discord_username: str) -> None:
     gc = _google_client()
     sh = gc.open_by_url(sheet_url)
     ws = sh.get_worksheet(0)
+    # Safety: re-check Col E is blank before writing (skip check when clearing).
+    # Prevents the bot from overwriting a name placed manually in the sheet.
+    if discord_username:
+        current = ws.cell(row_index, 5).value
+        if current is not None and str(current).strip():
+            raise RowAlreadyAssignedError(f"row {row_index} already assigned to '{current}'")
     ws.update_cell(row_index, 5, discord_username)  # E = 5
 
 
@@ -481,6 +492,11 @@ def _excel_get_next_task(xlsx_path: str) -> Optional[SheetTask]:
 def _excel_assign(xlsx_path: str, row_index: int, discord_username: str) -> None:
     wb = openpyxl.load_workbook(xlsx_path)
     ws = wb.active
+    # Safety: re-check Col E is blank before writing (skip check when clearing).
+    if discord_username:
+        current = ws.cell(row_index, 5).value
+        if current is not None and str(current).strip():
+            raise RowAlreadyAssignedError(f"row {row_index} already assigned to '{current}'")
     ws.cell(row_index, 5).value = discord_username
     wb.save(xlsx_path)
 
@@ -748,21 +764,31 @@ async def run_multi_assign_window(
             await try_remove_reaction(reaction, user)
             return
 
-        # claim a task atomically (sequential top-down)
-        async with pool_lock:
-            if not task_pool:
-                return
-            chosen = task_pool.pop(0)
-        row_index, task_no = chosen
-
-        # write to sheet
-        try:
-            await assign_task(sheet_src, row_index, member.name)
-        except Exception as e:
-            await send_logs(guild, f"⚠️ sheet write failed for task #{task_no}: {e}")
+        # claim a task and write to sheet — retry from pool if the row was
+        # filled externally (Col E already had a name). Don't put filled rows
+        # back in the pool; they're effectively claimed by whoever wrote there.
+        chosen = None
+        row_index = task_no = None
+        while True:
             async with pool_lock:
-                task_pool.append(chosen)  # put it back on failure
-            return
+                if not task_pool:
+                    return
+                chosen = task_pool.pop(0)
+            row_index, task_no = chosen
+            try:
+                await assign_task(sheet_src, row_index, member.name)
+                break  # success
+            except RowAlreadyAssignedError:
+                await send_logs(
+                    guild,
+                    f"⚠️ task #{task_no} (row {row_index}) already had a name in Col E — skipping (not overwritten)"
+                )
+                continue  # try next task in pool
+            except Exception as e:
+                await send_logs(guild, f"⚠️ sheet write failed for task #{task_no}: {e}")
+                async with pool_lock:
+                    task_pool.append(chosen)  # put it back on transient failure
+                return
 
         # apply cooldown
         expiry = now_ts() + cooldown_seconds
