@@ -4,6 +4,7 @@ import json
 import time
 import asyncio
 import random
+import html as html_lib
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
@@ -390,11 +391,24 @@ async def fetch_reddit_karma(username: str) -> tuple[int, int, int]:
     if "account has been suspended" in html.lower():
         raise ValueError("reddit account is suspended")
 
-    # old reddit uses "link karma" + "comment karma" text in the sidebar
-    link_m = re.search(r"(\d[\d,]*)\s+(?:link|post)\s+karma", html, flags=re.IGNORECASE)
-    com_m = re.search(r"(\d[\d,]*)\s+comment\s+karma", html, flags=re.IGNORECASE)
+    # Tier 1 — match the precise span structure used by old.reddit.com today:
+    #   <span class="karma">56</span>&#32; post karma
+    #   <span class="karma comment-karma">4,613</span>&#32; comment karma
+    link_m = re.search(r'class="karma"[^>]*>\s*([\d,]+)\s*<', html)
+    com_m = re.search(r'class="karma comment-karma"[^>]*>\s*([\d,]+)\s*<', html)
+
+    # Tier 2 — fallback: strip HTML tags, decode entities (&#32; etc.),
+    # then run a tolerant text regex. Catches future layout tweaks where
+    # Reddit changes class names but keeps "X post karma" / "X comment karma".
+    if not link_m or not com_m:
+        clean = html_lib.unescape(re.sub(r"<[^>]+>", " ", html))
+        link_m = re.search(r"(\d[\d,]*)\s+(?:link|post)\s+karma", clean, flags=re.IGNORECASE)
+        com_m = re.search(r"(\d[\d,]*)\s+comment\s+karma", clean, flags=re.IGNORECASE)
 
     if not link_m or not com_m:
+        # log a snippet so future layout changes are easier to diagnose
+        snippet = html[:500].replace("\n", " ")
+        print(f"[reddit_verify] parse failed for {u!r} — first 500 chars: {snippet}")
         raise ValueError("could not parse karma from profile page (layout changed or blocked).")
 
     link_karma = int(link_m.group(1).replace(",", ""))
